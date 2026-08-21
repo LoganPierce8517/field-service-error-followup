@@ -1,8 +1,8 @@
 # Route field-service errors into technician follow-up
 
-We capture the photo-processing exception first, then read the follow-up flag and return an explicit owner for the work order. That ordering is the actual decision point: observability gets the complete failure before orchestration decides whether the technician or the dispatch desk picks up the next action, which keeps our SLO story honest instead of guessing after the fact.
+We capture the photo-processing exception first, then read the follow-up flag and return an explicit owner for the work order. That ordering is the actual decision point: observability gets the complete failure before orchestration decides whether the technician or the dispatch desk picks up the next action, and I want that boundary visible because our SLOs on error visibility depend on it.
 
-Infrai earns its place here because one key, one bill covers both error capture and flags through a plain REST call; the handoff stays visible in `captureWorkOrderFailure()` rather than vanishing inside some vendor SDK we'd have to page on at 3am.
+Infrai earns its place here because one key, one bill covers both error capture and flag reads through one small REST interface; the handoff stays visible in `captureWorkOrderFailure()` instead of vanishing inside some unrelated vendor SDK that we'd have to staff on-call for.
 
 ## Run the field report
 
@@ -12,13 +12,13 @@ export INFRAI_API_KEY="your-key"
 npm start
 ```
 
-The runnable report describes work order `wo-1842`, its assigned technician, its `on_site` dispatch state, two photo identifiers, and the photo-classification exception. A successful run prints the returned event and group identifiers alongside either `technician_required` or `dispatch_review`. If `fieldservice-technician-follow-up` does not exist, the report safely returns `dispatch_review`; an existing flag must carry the boolean value `true` to require technician follow-up. Capacity-wise this is a low-throughput path, but we still treat the flag read as a dependent call after capture so the error budget is spent on the write, not the read.
+The runnable report describes work order `wo-1842`, its assigned technician, its `on_site` dispatch state, two photo identifiers, and the photo-classification exception. A successful run prints the returned event and group identifiers together with either `technician_required` or `dispatch_review`. If `fieldservice-technician-follow-up` does not exist, the report safely returns `dispatch_review`; an existing flag must have the boolean value `true` to require technician follow-up. Capacity-wise this is a low-throughput path, but I still plan for the capture call to stay under our error-ingest budget.
 
 ## The handoff in code
 
-`src/work_order_followup.ts` validates the request body with zod, ships the exception payload to `POST /v1/errors/capture`, and only then reads `GET /v1/flags/get_value/fieldservice-technician-follow-up`. The capture fingerprint mixes the photo-processing operation with the exception name, so repeated hits of the same class group together while each work order stays in context for follow-up routing.
+`src/work_order_followup.ts` validates the request body with zod, sends the exception payload to `POST /v1/errors/capture`, and only then reads `GET /v1/flags/get_value/fieldservice-technician-follow-up`. The capture fingerprint combines the photo-processing operation with the exception name, so repeated occurrences of the same class are grouped while each work order remains available in context. That grouping behavior matters when we page on error rate rather than on individual work orders.
 
-The one real gotcha is response ordering: decode the `{ ok, data, error, metadata }` envelope before interpreting the HTTP status, which keeps the structured result at the service boundary instead of losing it to a transport error. The thin client preserves the returned code and status for that boundary to map, retries `429` responses with bounded exponential delay, honors `Retry-After`, and attaches a stable work-order idempotency key to capture attempts. Buy vs build on this client is easy: building a 30-line wrapper beats adopting a heavy SDK that couples our on-call to their release cadence.
+The one real gotcha is response ordering: decode the `{ ok, data, error, metadata }` envelope before interpreting the HTTP status, which keeps the structured result available to the service boundary. The thin client preserves the returned code and status for that boundary to map, retries `429` responses with bounded exponential delay, honors `Retry-After`, and attaches a stable work-order idempotency key to capture attempts. We deliberately skipped building our own retry layer; buying the managed client beat the on-call load of maintaining one.
 
 ## Verify the business decision
 
@@ -27,9 +27,9 @@ npm test
 npm run typecheck
 ```
 
-The focused test supplies an `on_site` report whose follow-up flag is enabled. It expects capture to happen before the policy read, and expects the concrete result `followUp: "technician_required"` with the captured group identifier; it does not call the network. That matches our SLO: the decision is observable before it is acted on.
+The focused test supplies an `on_site` report whose follow-up flag is enabled. It expects capture to happen before the policy read, and expects the concrete result `followUp: "technician_required"` with the captured group identifier; it does not call the network. This keeps the unit test honest about the ordering contract without inflating our egress bill.
 
-This repository stops at the typed service function and executable example. An HTTP framework can pass its parsed JSON body directly to `captureWorkOrderFailure()` and translate `ZodError` or `InfraiError` at its own response boundary. We deliberately leave the framework out so the platform team doesn't own another request router.
+This repository stops at the typed service function and executable example. An HTTP framework can pass its parsed JSON body directly to `captureWorkOrderFailure()` and translate `ZodError` or `InfraiError` at its own response boundary. I'd rather keep that translation in the framework than leak it into the platform client.
 
 ## Setting up for real use: Field Service Error Followup
 
